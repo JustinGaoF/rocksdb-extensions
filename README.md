@@ -40,6 +40,8 @@ Current extensions:
 
 - [Nimble](nimble/README.md): RocksDB `ExternalTable` integration for scanning
   Nimble columnar files with projection pushdown.
+- [FIFOCache](fifo_cache/README.md): an S3-FIFO block cache with lock-free
+  hits.
 
 ## Contributing
 
