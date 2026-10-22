@@ -445,10 +445,10 @@ patch_flatbuffers_include_build_flags
 
 cmake \
   --build "${build_directory}" \
-  --target rocksdb_extensions_nimble_test \
+  --target rocksdb_extensions_nimble_test rocksdb_extensions_fifo_cache_test \
   --parallel "${build_jobs}"
 
 ctest \
   --test-dir "${build_directory}" \
-  -R '^rocksdb_extensions_nimble_test$' \
+  -R '^rocksdb_extensions_(nimble|fifo_cache)_test$' \
   --output-on-failure
