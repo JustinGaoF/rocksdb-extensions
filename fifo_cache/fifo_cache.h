@@ -19,14 +19,22 @@
 #include <utility>
 #include <vector>
 
-#include "../include/rocksdb_extensions/fifo_cache/FIFOCache.h"
-#include "Autovector.h"
-#include "MemMapping.h"
-#include "Port.h"
-#include "ShardedCache.h"
+#include "cache/sharded_cache.h"
+#include "plugin/fifo_cache/fifo_cache_options.h"
+#include "plugin/fifo_cache/no_reserve_mapping.h"
+#include "port/lang.h"
+#include "port/likely.h"
+#include "port/mmap.h"
+#include "port/port.h"
 #include "rocksdb/utilities/options_type.h"
+#include "table/unique_id_impl.h"
+#include "util/autovector.h"
+#include "util/distributed_mutex.h"
+#include "util/hash.h"
+#include "util/hash_containers.h"
 
-namespace facebook::rocks::fifo_cache {
+namespace ROCKSDB_NAMESPACE {
+namespace fifo_cache {
 
 // FIFO cache implementation.
 //
@@ -185,7 +193,7 @@ static_assert(sizeof(FIFOHandle::HeapKey*) <= sizeof(uint64_t),
 // threads, 4 GiB, the first 5 s from a cold cache): at most 9 such misses
 // per 44M-71M lookups, and at most 0.02% of the lookups that overlapped a
 // growth step, so a miss is not retried.
-class alignas(kCacheLineSize) FIFOCacheShard final : public CacheShardBase {
+class ALIGN_AS(CACHE_LINE_SIZE) FIFOCacheShard final : public CacheShardBase {
  public:
   // NOTE: the eviction_callback ptr is saved, as is it assumed to be kept
   // alive in Cache. max_upper_hash_bits is unused: homes come from the low
@@ -257,8 +265,9 @@ class alignas(kCacheLineSize) FIFOCacheShard final : public CacheShardBase {
                                const Cache::CacheItemHelper* helper,
                                size_t charge, bool allow_uncharged);
 
-  // helper, create_context, priority and stats are ignored: this cache has
-  // no secondary tier, so this is a primary-only lookup.
+  // helper, create_context, priority and stats are ignored: with no secondary
+  // cache configured this is a primary-only lookup. Secondary promotion is
+  // handled by CacheWithSecondaryAdapter above the shard, as with LRU.
   // A hit increments freq (saturating) and moves nothing.
   FIFOHandle* Lookup(const Slice& key, HashCref hash,
                      const Cache::CacheItemHelper* helper,
@@ -326,7 +335,7 @@ class alignas(kCacheLineSize) FIFOCacheShard final : public CacheShardBase {
 
   // Test-only: lets a test hold the shard lock to show that hits never take
   // it.
-  Mutex& TEST_GetMutex() const { return mutex_; }
+  DMutex& TEST_GetMutex() const { return mutex_; }
 
   void AppendPrintableOptions(std::string& /*str*/) const;
 
@@ -469,7 +478,7 @@ class alignas(kCacheLineSize) FIFOCacheShard final : public CacheShardBase {
   // The resident entry after e in clock order, skipping the dummy head.
   FIFOHandle* ResidentNext(FIFOHandle* e);
   // Whether e is a zero-charge kNoopCacheItemHelper entry, as
-  // RocksDB's CacheWithSecondaryAdapter inserts to record recent use of a key.
+  // CacheWithSecondaryAdapter inserts to record recent use of a key.
   bool IsPlaceholder(const FIFOHandle* e) const;
   // Keeps over_capacity_ equal to usage_ > capacity_. Needs mutex_.
   void SyncOverCapacity();
@@ -609,7 +618,7 @@ class alignas(kCacheLineSize) FIFOCacheShard final : public CacheShardBase {
   // current owner writes it, and only on a probation ref change. A reader
   // outlives its thread and passes to a later one together with its slots,
   // so no slot is ever read through freed thread-local state.
-  struct alignas(kCacheLineSize) ReaderSlot {
+  struct ALIGN_AS(CACHE_LINE_SIZE) ReaderSlot {
     std::atomic<size_t> probation_pinned{0};
     // The owning reader's index, the slot's position in folded_slot_values_.
     uint32_t index = 0;
@@ -734,11 +743,11 @@ class alignas(kCacheLineSize) FIFOCacheShard final : public CacheShardBase {
 
   // Memory size for entries residing in the cache, including pinned
   // entries detached from the table but still referenced.
-  alignas(kCacheLineSize) LockedSize usage_;
+  ALIGN_AS(CACHE_LINE_SIZE) LockedSize usage_;
 
   // The slot array: kFirstSlot + max_length_ slots, mapped lazily and
   // zero-initialized, so a fresh slot has head == 0.
-  TypedMemMapping<FIFOHandle> slots_;
+  NoReserveTypedMemMapping<FIFOHandle> slots_;
   // Homes in use (kFirstSlot + used_length_ slots), and the most there can
   // be.
   size_t used_length_;
@@ -816,8 +825,8 @@ class alignas(kCacheLineSize) FIFOCacheShard final : public CacheShardBase {
   // (GhostTrim). Erasing entries does not trim, so after erases ghost_size_
   // can exceed occupancy_ until one of those runs.
   // Placeholder inserts (zero charge, kNoopCacheItemHelper, as
-  // RocksDB's CacheWithSecondaryAdapter uses to record recent use) neither take
-  // nor leave a ghost, so readmission credit reaches the real entry.
+  // CacheWithSecondaryAdapter uses to record recent use) neither take nor
+  // leave a ghost, so readmission credit reaches the real entry.
   // ghost_index_ maps a hash to the sequence number of its latest slot, so
   // a stale slot (consumed by readmission, or superseded) is skipped when
   // it reaches the head; stale slots still count toward the bound.
@@ -840,7 +849,7 @@ class alignas(kCacheLineSize) FIFOCacheShard final : public CacheShardBase {
   // ghost_head_seq_ + ghost_size_.
   uint64_t ghost_head_seq_;
   size_t ghost_size_;
-  using GhostIndex = std::unordered_map<uint32_t, uint64_t>;
+  using GhostIndex = UnorderedMap<uint32_t, uint64_t>;
   GhostIndex ghost_index_;
   // Total charge of all slots in the ring, stale ones included.
   size_t ghost_charge_;
@@ -850,7 +859,7 @@ class alignas(kCacheLineSize) FIFOCacheShard final : public CacheShardBase {
 
   // We don't count mutex_ as the cache's internal state so semantically we
   // don't mind mutex_ invoking the non-const actions.
-  mutable Mutex mutex_;
+  mutable DMutex mutex_;
 
   // From Cache, needed for delete
   MemoryAllocator* const allocator_;
@@ -879,8 +888,8 @@ class alignas(kCacheLineSize) FIFOCacheShard final : public CacheShardBase {
   // ReaderSlot chunks, allocated on first use without mutex_ and freed with
   // the shard. Read on probation ref changes, written only when a chunk is
   // installed, so kept off the lines a hit reads.
-  alignas(kCacheLineSize) std::array<std::atomic<ReaderSlot*>,
-                                     kReaderSlotChunks> reader_slot_chunks_{};
+  ALIGN_AS(CACHE_LINE_SIZE)
+  std::array<std::atomic<ReaderSlot*>, kReaderSlotChunks> reader_slot_chunks_{};
 };
 
 class FIFOCache
@@ -905,9 +914,15 @@ class FIFOCache
   size_t TEST_GetFIFOSize();
 };
 
+}  // namespace fifo_cache
+
+using FIFOCache = fifo_cache::FIFOCache;
+using FIFOHandle = fifo_cache::FIFOHandle;
+using FIFOCacheShard = fifo_cache::FIFOCacheShard;
+
 // The fifo_cache:// option fields. Built on first use, so it is ready even
 // when called during another translation unit's static initialization.
 const std::unordered_map<std::string, OptionTypeInfo>&
 FIFOCacheOptionsTypeInfo();
 
-}  // namespace facebook::rocks::fifo_cache
+}  // namespace ROCKSDB_NAMESPACE

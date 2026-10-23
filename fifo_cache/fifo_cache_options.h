@@ -1,33 +1,31 @@
-// Copyright (c) Meta Platforms, Inc. and affiliates.
-// This source code is licensed under both the GPLv2 (found in the
-// COPYING file in the root directory) and Apache 2.0 License
-// (found in the LICENSE.Apache file in the root directory).
+//  Copyright (c) Meta Platforms, Inc. and affiliates.
+//  This source code is licensed under both the GPLv2 (found in the
+//  COPYING file in the root directory) and Apache 2.0 License
+//  (found in the LICENSE.Apache file in the root directory).
+
+// FIFOCache's public API. Installed with RocksDB as
+// rocksdb/plugin/fifo_cache/fifo_cache_options.h.
 
 #pragma once
 
 #include <cstddef>
 #include <memory>
-#include <string>
 #include <utility>
 
 #include "rocksdb/cache.h"
 
 namespace ROCKSDB_NAMESPACE {
-class ObjectLibrary;
-}  // namespace ROCKSDB_NAMESPACE
-
-namespace facebook::rocks {
 
 // EXPERIMENTAL: the API and the fifo_cache:// option string are subject to
 // change.
-// FIFOCache - A RocksDB block cache using segmented FIFO eviction (S3-FIFO,
-// SOSP '23) to stay at or below a set capacity. The cache is sharded to
-// 2^num_shard_bits shards, by hash of the key. The total capacity is divided
-// and evenly assigned to each shard, and each shard has two FIFO queues for
-// evictions: new entries enter probation, and probation victims with enough
-// access frequency are promoted to resident (second-chance) instead of being
-// evicted. Keys (not values) recently evicted from probation are remembered,
-// and re-inserting one goes directly to resident. Placement is inferred
+// FIFOCache - A cache using segmented FIFO eviction to stay at or below a
+// set capacity. The cache is sharded to 2^num_shard_bits shards, by hash of
+// the key. The total capacity is divided and evenly assigned to each shard,
+// and each shard has two FIFO queues for evictions: new entries enter
+// probation, and probation victims with enough access frequency are promoted
+// to resident (second-chance) instead of being evicted. Keys (not values)
+// recently evicted from probation are remembered, and re-inserting one goes
+// directly to resident. Placement is inferred
 // from access frequency: Cache::Priority is ignored. Lookups take no lock;
 // inserts, erases and eviction take a per-shard mutex. Pinned entries are
 // never evicted; eviction sets long-pinned entries aside instead of
@@ -62,20 +60,19 @@ namespace facebook::rocks {
 // slower. So keep the default unless the cache is much smaller than its hot
 // set.
 //
-// Creating one: call MakeSharedCache, or register the cache with
-// RegisterFIFOCache and pass "fifo_cache://capacity=<n>;..." (the scalar
-// fields below) to Cache::CreateFromString with an empty result, as db_bench
-// --cache_uri does. A nested block_cache={fifo_cache://...} in an options
-// string is not supported: there RocksDB parses the value as options for the
-// block cache already set (the default one), so set block_cache in C++.
-// memory_allocator can only be set in C++. secondary_cache is not supported
-// by this extension.
-struct FIFOCacheOptions : public ROCKSDB_NAMESPACE::ShardedCacheOptions {
+// This is an opt-in implementation and not the default block cache. Besides
+// MakeSharedCache, a RocksDB built with this plugin creates one from
+// "fifo_cache://capacity=<n>;..." with the scalar fields below: as the whole
+// value given to Cache::CreateFromString with an empty result (e.g. db_bench
+// --cache_uri), or as the id of a block_cache option value (e.g.
+// block_cache={id={fifo_cache://capacity=1G;num_shard_bits=6}}).
+// memory_allocator and secondary_cache can only be set in C++.
+struct FIFOCacheOptions : public ShardedCacheOptions {
   // Whether to use adaptive mutexes for cache shards. Note that adaptive
   // mutexes need to be supported by the platform in order for this to have any
   // effect. The default value is true if RocksDB is compiled with
   // -DROCKSDB_DEFAULT_TO_ADAPTIVE_MUTEX, false otherwise.
-  bool use_adaptive_mutex = ROCKSDB_NAMESPACE::kDefaultToAdaptiveMutex;
+  bool use_adaptive_mutex = kDefaultToAdaptiveMutex;
 
   // Capacity the slot table is reserved for, when larger than capacity (see
   // above). Set it to the largest capacity SetCapacity may raise this cache
@@ -87,33 +84,18 @@ struct FIFOCacheOptions : public ROCKSDB_NAMESPACE::ShardedCacheOptions {
   FIFOCacheOptions() {}
   // Every argument is required, so a positional call written for another
   // cache's options does not compile.
-  FIFOCacheOptions(
-      size_t _capacity, int _num_shard_bits, bool _strict_capacity_limit,
-      std::shared_ptr<ROCKSDB_NAMESPACE::MemoryAllocator> _memory_allocator,
-      bool _use_adaptive_mutex,
-      ROCKSDB_NAMESPACE::CacheMetadataChargePolicy _metadata_charge_policy)
-      : ROCKSDB_NAMESPACE::ShardedCacheOptions(
-            _capacity, _num_shard_bits, _strict_capacity_limit,
-            std::move(_memory_allocator), _metadata_charge_policy),
+  FIFOCacheOptions(size_t _capacity, int _num_shard_bits,
+                   bool _strict_capacity_limit,
+                   std::shared_ptr<MemoryAllocator> _memory_allocator,
+                   bool _use_adaptive_mutex,
+                   CacheMetadataChargePolicy _metadata_charge_policy)
+      : ShardedCacheOptions(_capacity, _num_shard_bits, _strict_capacity_limit,
+                            std::move(_memory_allocator),
+                            _metadata_charge_policy),
         use_adaptive_mutex(_use_adaptive_mutex) {}
 
-  // Construct an instance of FIFOCache using these options. Returns nullptr
-  // if num_shard_bits >= 20 or secondary_cache is set.
-  std::shared_ptr<ROCKSDB_NAMESPACE::Cache> MakeSharedCache() const;
+  // Construct an instance of FIFOCache using these options
+  std::shared_ptr<Cache> MakeSharedCache() const;
 };
 
-// Registers the "fifo_cache://" form with library, so that
-// Cache::CreateFromString and option strings naming a block cache can create
-// a FIFOCache. A bad option string fails with InvalidArgument. Typically
-// called once at startup on *ROCKSDB_NAMESPACE::ObjectLibrary::Default().
-// Returns the number of factories registered. arg is unused (the RocksDB
-// plugin registrar signature).
-int RegisterFIFOCache(ROCKSDB_NAMESPACE::ObjectLibrary& library,
-                      const std::string& arg);
-
-}  // namespace facebook::rocks
-
-// RegisterFIFOCache with C linkage, the form RocksDB's plugin build
-// (ROCKSDB_PLUGINS=fifo_cache) calls at startup.
-extern "C" int rocksdb_extensions_fifo_cache_register(
-    ROCKSDB_NAMESPACE::ObjectLibrary& library, const std::string& arg);
+}  // namespace ROCKSDB_NAMESPACE
