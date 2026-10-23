@@ -34,6 +34,8 @@
 // entry take a per-shard mutex. So the shard count only spreads inserts;
 // FIFOCacheOptions in FIFOCache.h says how to choose it.
 
+#include "FIFOCacheImpl.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -43,12 +45,18 @@
 #include <exception>
 #include <limits>
 
-#include "FIFOCacheImpl.h"
-#include "SyncPoint.h"
-#include "rocksdb/convenience.h"
+#include "cache/secondary_cache_adapter.h"
+#include "port/lang.h"
+#include "test_util/sync_point.h"
+#include "util/cast_util.h"
+#include "util/distributed_mutex.h"
+#include "util/hash.h"
+#include "util/math.h"
 #include "rocksdb/utilities/object_registry.h"
 
 namespace facebook::rocks::fifo_cache {
+
+using namespace ROCKSDB_NAMESPACE;  // NOLINT(google-build-using-namespace)
 
 namespace {
 
@@ -70,7 +78,7 @@ inline size_t LengthInfoToUsedLength(uint64_t length_info) {
 // Every thread's announcement for epoch reclamation, one per thread for the
 // whole process. Never freed: a thread's reader is adopted by a later
 // thread once it exits.
-struct alignas(kCacheLineSize) ThreadReader {
+struct ALIGN_AS(CACHE_LINE_SIZE) ThreadReader {
   // The shard a Lookup in flight is reading, valid while epoch != 0.
   std::atomic<const void*> shard{nullptr};
   std::atomic<uint64_t> epoch{0};
@@ -146,7 +154,7 @@ struct ThreadReaderHolder {
 // reachable from ThreadReaders().
 ThreadReader* OwnThreadReader() {
   ThreadReader* reader = TlsReader();
-  if (ROCKSDB_EXT_LIKELY(reader != nullptr)) {
+  if (LIKELY(reader != nullptr)) {
     return reader;
   }
   if (!TlsReaderReleased()) {
@@ -160,7 +168,7 @@ ThreadReader* OwnThreadReader() {
 // caller then owns the returned reader for one Lookup and must disown it.
 ThreadReader* MyThreadReader(bool* temporary) {
   ThreadReader* reader = OwnThreadReader();
-  if (ROCKSDB_EXT_LIKELY(reader != nullptr)) {
+  if (LIKELY(reader != nullptr)) {
     return reader;
   }
   *temporary = true;
@@ -339,7 +347,7 @@ FIFOCacheShard::FIFOCacheShard(size_t capacity, bool strict_capacity_limit,
       length_info_(0),
       slots_base_(nullptr),
       usage_(0),
-      slots_(MemMapping::AllocateLazyZeroedNoReserve(
+      slots_(SlotTableMapping::Allocate(
           sizeof(FIFOHandle) *
           (kFirstSlot + MaxLengthFor(std::max(capacity, max_capacity)) + 1))),
       used_length_(0),
@@ -367,7 +375,7 @@ FIFOCacheShard::FIFOCacheShard(size_t capacity, bool strict_capacity_limit,
       reclaim_ticks_(0),
       reader_ticks_(0),
       scan_due_(false) {
-  slots_base_ = slots_.Get();
+  slots_base_ = static_cast<FIFOHandle*>(slots_.Get());
   if (slots_base_ == nullptr) {
     fprintf(stderr, "Anonymous mmap for RocksDB FIFOCache failed. Aborting.\n");
     std::terminate();
@@ -428,7 +436,7 @@ void FIFOCacheShard::RemoveFromTable(FIFOHandle* e) {
 void FIFOCacheShard::EraseUnRefEntries() {
   autovector<FIFOHandle*> last_reference_list;
   {
-    MutexLock l(mutex_);
+    DMutexLock l(mutex_);
     for (FIFOHandle* queue : {probation(), resident(), aside()}) {
       FIFOHandle* cur = Next(queue);
       while (cur != queue) {
@@ -457,7 +465,7 @@ void FIFOCacheShard::EraseUnRefEntries() {
 
   std::vector<FIFOHandle::HeapKey*> heap_keys;
   {
-    MutexLock l(mutex_);
+    DMutexLock l(mutex_);
     ShrinkTableIfEmpty(&heap_keys);
   }
   FreeHeapKeys(heap_keys);
@@ -495,7 +503,7 @@ void FIFOCacheShard::ApplyToSomeEntries(
                              size_t charge,
                              const Cache::CacheItemHelper* helper)>& callback,
     size_t average_entries_per_lock, size_t* state) {
-  MutexLock l(mutex_);
+  DMutexLock l(mutex_);
   assert(average_entries_per_lock > 0);
   // *state is the next slot to visit; slots never move, so growth between
   // calls neither skips nor repeats an entry.
@@ -525,19 +533,19 @@ void FIFOCacheShard::ApplyToSomeEntries(
 }
 
 size_t FIFOCacheShard::TEST_GetProbationUsage() const {
-  MutexLock l(mutex_);
+  DMutexLock l(mutex_);
   return probation_usage_;
 }
 
 size_t FIFOCacheShard::TEST_GetProbationUnpinnedUsage() {
   MySlot();
-  MutexLock l(mutex_);
+  DMutexLock l(mutex_);
   FoldSlots();
   return ProbationUnpinnedUsage();
 }
 
 size_t FIFOCacheShard::TEST_GetProbationBudget() const {
-  MutexLock l(mutex_);
+  DMutexLock l(mutex_);
   return ProbationBudget();
 }
 
@@ -547,17 +555,17 @@ size_t FIFOCacheShard::ProbationBudget() const {
 }
 
 size_t FIFOCacheShard::TEST_GetGhostSize() const {
-  MutexLock l(mutex_);
+  DMutexLock l(mutex_);
   return ghost_size_;
 }
 
 void FIFOCacheShard::TEST_GetFIFOList(FIFOHandle** fifo) {
-  MutexLock l(mutex_);
+  DMutexLock l(mutex_);
   *fifo = probation();
 }
 
 size_t FIFOCacheShard::TEST_GetAsideSize() {
-  MutexLock l(mutex_);
+  DMutexLock l(mutex_);
   size_t size = 0;
   for (FIFOHandle* h = Next(aside()); h != aside(); h = Next(h)) {
     size++;
@@ -566,7 +574,7 @@ size_t FIFOCacheShard::TEST_GetAsideSize() {
 }
 
 size_t FIFOCacheShard::TEST_GetFIFOSize() {
-  MutexLock l(mutex_);
+  DMutexLock l(mutex_);
   size_t size = 0;
   for (FIFOHandle* h = Next(probation()); h != probation(); h = Next(h)) {
     size++;
@@ -1107,17 +1115,17 @@ void FIFOCacheShard::FreeHeapKeys(
 
 FIFOCacheShard::ReaderSlot* FIFOCacheShard::MySlot() {
   const ThreadReader* reader = OwnThreadReader();
-  if (ROCKSDB_EXT_UNLIKELY(reader == nullptr)) {
+  if (UNLIKELY(reader == nullptr)) {
     // Exiting thread: its reader may already belong to another thread.
     return nullptr;
   }
   const size_t chunk = reader->index / kReaderSlotsPerChunk;
-  if (ROCKSDB_EXT_UNLIKELY(chunk >= kReaderSlotChunks)) {
+  if (UNLIKELY(chunk >= kReaderSlotChunks)) {
     return nullptr;
   }
   ReaderSlot* slots =
       reader_slot_chunks_[chunk].load(std::memory_order_acquire);
-  if (ROCKSDB_EXT_UNLIKELY(slots == nullptr)) {
+  if (UNLIKELY(slots == nullptr)) {
     auto* fresh = new ReaderSlot[kReaderSlotsPerChunk];
     for (size_t i = 0; i < kReaderSlotsPerChunk; ++i) {
       fresh[i].index = static_cast<uint32_t>(chunk * kReaderSlotsPerChunk + i);
@@ -1135,10 +1143,10 @@ FIFOCacheShard::ReaderSlot* FIFOCacheShard::MySlot() {
 
 void FIFOCacheShard::CreditProbationPin(size_t delta) {
   ReaderSlot* slot = MySlot();
-  if (ROCKSDB_EXT_LIKELY(slot != nullptr)) {
+  if (LIKELY(slot != nullptr)) {
     slot->AddProbationPinned(delta);
   } else {
-    MutexLock l(mutex_);
+    DMutexLock l(mutex_);
     probation_pinned_usage_ += delta;
   }
 }
@@ -1147,7 +1155,7 @@ void FIFOCacheShard::SetCapacity(size_t capacity) {
   autovector<FIFOHandle*> last_reference_list;
   MySlot();
   {
-    MutexLock l(mutex_);
+    DMutexLock l(mutex_);
     capacity_ = capacity;
     // Fresh pin counts for the queue choice: folds otherwise run only once
     // per ReaderWorkInterval() calls.
@@ -1167,7 +1175,7 @@ void FIFOCacheShard::SetCapacity(size_t capacity) {
   // entries.
   std::vector<FIFOHandle::HeapKey*> heap_keys;
   {
-    MutexLock l(mutex_);
+    DMutexLock l(mutex_);
     if (occupancy_ == 0 && TableAboveInitialLength()) {
       ShrinkTableIfEmpty(&heap_keys);
     }
@@ -1176,7 +1184,7 @@ void FIFOCacheShard::SetCapacity(size_t capacity) {
 }
 
 void FIFOCacheShard::SetStrictCapacityLimit(bool strict_capacity_limit) {
-  MutexLock l(mutex_);
+  DMutexLock l(mutex_);
   strict_capacity_limit_ = strict_capacity_limit;
 }
 
@@ -1185,7 +1193,8 @@ FIFOHandle* FIFOCacheShard::NewStandalone(HashCref hash,
                                           Cache::ObjectPtr value,
                                           const Cache::CacheItemHelper* helper,
                                           size_t total_charge) {
-  FIFOHandle* e = new (CachelineAlignedAlloc(sizeof(FIFOHandle))) FIFOHandle();
+  FIFOHandle* e =
+      new (port::cacheline_aligned_alloc(sizeof(FIFOHandle))) FIFOHandle();
   SetKey(e, hash, heap_key, FIFOHandle::kStandalone);
   e->value = value;
   e->helper = helper;
@@ -1200,7 +1209,7 @@ void FIFOCacheShard::FreeStandalone(FIFOHandle* h) {
     free(const_cast<FIFOHandle::HeapKey*>(h->heap_key()));
   }
   h->~FIFOHandle();
-  CachelineAlignedFree(h);
+  port::cacheline_aligned_free(h);
 }
 
 Status FIFOCacheShard::InsertItem(const Slice& key, HashCref hash,
@@ -1220,7 +1229,7 @@ Status FIFOCacheShard::InsertItem(const Slice& key, HashCref hash,
   MySlot();
   bool scan = false;
   {
-    MutexLock l(mutex_);
+    DMutexLock l(mutex_);
     scan = MaybeReclaim(&heap_keys);
 
     // Free the space following strict FIFO policy until enough space
@@ -1438,7 +1447,7 @@ FIFOHandle* FIFOCacheShard::Lookup(const Slice& key, HashCref hash,
   }
   // The ref, if taken, keeps e alive from here on.
   reader->epoch.store(0, std::memory_order_release);
-  if (ROCKSDB_EXT_UNLIKELY(temporary_reader)) {
+  if (UNLIKELY(temporary_reader)) {
     reader->owned.store(false, std::memory_order_release);
   }
   if (e == nullptr) {
@@ -1497,7 +1506,7 @@ bool FIFOCacheShard::Release(FIFOHandle* e, bool /*useful*/,
 bool FIFOCacheShard::ReleaseLocked(FIFOHandle* e, bool erase_if_last_ref) {
   const size_t charge = e->total_charge;
   {
-    MutexLock l(mutex_);
+    DMutexLock l(mutex_);
     // Lookups may still add refs while e is in cache, so decide on each
     // snapshot. Erasing drops the last ref and both bits in one step.
     uint32_t s = e->state.load(std::memory_order_relaxed);
@@ -1612,7 +1621,7 @@ FIFOHandle* FIFOCacheShard::CreateStandalone(
 
   MySlot();
   {
-    MutexLock l(mutex_);
+    DMutexLock l(mutex_);
 
     EvictFromFIFO(e->total_charge, 0, &last_reference_list);
 
@@ -1645,7 +1654,7 @@ void FIFOCacheShard::Erase(const Slice& key, HashCref hash) {
   std::vector<FIFOHandle::HeapKey*> heap_keys;
   bool scan = false;
   {
-    MutexLock l(mutex_);
+    DMutexLock l(mutex_);
     scan = MaybeReclaim(&heap_keys);
     e = FindInTable(key, hash);
     if (e != nullptr) {
@@ -1667,7 +1676,7 @@ void FIFOCacheShard::Erase(const Slice& key, HashCref hash) {
 }
 
 size_t FIFOCacheShard::GetUsage() const {
-  MutexLock l(mutex_);
+  DMutexLock l(mutex_);
   return usage_.Get();
 }
 
@@ -1691,19 +1700,19 @@ size_t FIFOCacheShard::GetPinnedUsage() const {
     }
   }
   reader->epoch.store(0, std::memory_order_release);
-  if (ROCKSDB_EXT_UNLIKELY(temporary_reader)) {
+  if (UNLIKELY(temporary_reader)) {
     reader->owned.store(false, std::memory_order_release);
   }
   return pinned;
 }
 
 size_t FIFOCacheShard::GetOccupancyCount() const {
-  MutexLock l(mutex_);
+  DMutexLock l(mutex_);
   return occupancy_;
 }
 
 size_t FIFOCacheShard::GetTableAddressCount() const {
-  MutexLock l(mutex_);
+  DMutexLock l(mutex_);
   return used_length_;
 }
 
@@ -1733,7 +1742,7 @@ size_t FIFOCacheShard::HomeCharge() const {
 }
 
 size_t FIFOCacheShard::TEST_GetTableOccupancyCount() const {
-  MutexLock l(mutex_);
+  DMutexLock l(mutex_);
   return occupancy_;
 }
 
@@ -1788,10 +1797,6 @@ size_t FIFOCache::TEST_GetFIFOSize() {
       [](FIFOCacheShard& cs) { return cs.TEST_GetFIFOSize(); });
 }
 
-namespace {
-constexpr char kUriPrefix[] = "fifo_cache://";
-}  // namespace
-
 const std::unordered_map<std::string, OptionTypeInfo>&
 FIFOCacheOptionsTypeInfo() {
   static const std::unordered_map<std::string, CacheMetadataChargePolicy>
@@ -1826,19 +1831,44 @@ FIFOCacheOptionsTypeInfo() {
   return type_info;
 }
 
+namespace {
+constexpr char kUriPrefix[] = "fifo_cache://";
+}  // namespace
+
+// Sanitizes options in place. Returns false when they cannot be met.
+bool SanitizeOptions(FIFOCacheOptions* opts) {
+  if (opts->num_shard_bits >= 20) {
+    // The cache cannot be sharded into too many fine pieces.
+    return false;
+  }
+  if (opts->num_shard_bits < 0) {
+    opts->num_shard_bits = GetDefaultCacheShardBits(opts->capacity);
+  }
+  return true;
+}
+
 // The cache for sanitized options, or nullptr when they cannot be met.
-std::unique_ptr<FIFOCache> NewFIFOCache(const FIFOCacheOptions& options) {
-  if (options.num_shard_bits >= 20 || options.secondary_cache) {
-    // Too many fine pieces, or a secondary cache, which this extension does
-    // not support (RocksDB's adapter for it is internal).
+// Unique-owned, for the object-registry factory.
+std::unique_ptr<Cache> NewFIFOCacheUnique(const FIFOCacheOptions& options) {
+  FIFOCacheOptions opts = options;
+  if (!SanitizeOptions(&opts)) {
     return nullptr;
   }
-  // For sanitized options
-  FIFOCacheOptions opts = options;
-  if (opts.num_shard_bits < 0) {
-    opts.num_shard_bits = GetDefaultCacheShardBits(opts.capacity);
+  if (opts.secondary_cache) {
+    std::shared_ptr<Cache> primary = std::make_shared<FIFOCache>(opts);
+    return std::make_unique<CacheWithSecondaryAdapter>(primary,
+                                                       opts.secondary_cache);
   }
   return std::make_unique<FIFOCache>(opts);
+}
+
+// The cache for sanitized options, or nullptr when they cannot be met.
+std::shared_ptr<Cache> NewFIFOCache(const FIFOCacheOptions& options) {
+  std::unique_ptr<Cache> cache = NewFIFOCacheUnique(options);
+  if (cache == nullptr) {
+    return nullptr;
+  }
+  return std::shared_ptr<Cache>(std::move(cache));
 }
 
 }  // namespace facebook::rocks::fifo_cache
@@ -1859,8 +1889,7 @@ int RegisterFIFOCache(ROCKSDB_NAMESPACE::ObjectLibrary& library,
           .AddSeparator("://", /*at_least_one*/ false),
       [](const std::string& uri, std::unique_ptr<Cache>* guard,
          std::string* errmsg) -> Cache* {
-        // The registry hands over the whole string, braces trimmed by the
-        // option parser when nested.
+        // The registry hands over the whole string.
         ROCKSDB_NAMESPACE::ConfigOptions config_options;
         FIFOCacheOptions opts;
         ROCKSDB_NAMESPACE::Status s =
@@ -1879,7 +1908,11 @@ int RegisterFIFOCache(ROCKSDB_NAMESPACE::ObjectLibrary& library,
           *errmsg = s.ToString();
           return nullptr;
         }
-        *guard = fifo_cache::NewFIFOCache(opts);
+        *guard = fifo_cache::NewFIFOCacheUnique(opts);
+        if (guard->get() == nullptr) {
+          *errmsg = "fifo_cache: cannot build cache from options";
+          return nullptr;
+        }
         return guard->get();
       });
   return 1;

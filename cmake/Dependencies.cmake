@@ -116,16 +116,18 @@ endfunction()
 
 find_package(RocksDB CONFIG QUIET)
 if(NOT TARGET RocksDB::rocksdb AND NOT TARGET rocksdb AND NOT TARGET rocksdb_static)
+  # Building RocksDB from source (either path below): tests and tools off, so
+  # its bundled gtest target does not clash with the GTest this repo fetches.
+  set(WITH_TESTS OFF CACHE BOOL "" FORCE)
+  set(WITH_TOOLS OFF CACHE BOOL "" FORCE)
+  set(WITH_BENCHMARK_TOOLS OFF CACHE BOOL "" FORCE)
+  set(WITH_CORE_TOOLS OFF CACHE BOOL "" FORCE)
   rocksdb_extensions_add_source_dependency(
     ROCKSDB_EXTENSIONS_ROCKSDB_SOURCE_ADDED
     rocksdb
     "${ROCKSDB_EXTENSIONS_ROCKSDB_SOURCE_DIR}")
 endif()
 if(NOT TARGET RocksDB::rocksdb AND NOT TARGET rocksdb AND NOT TARGET rocksdb_static AND NOT ROCKSDB_EXTENSIONS_ROCKSDB_SOURCE_ADDED)
-  set(WITH_TESTS OFF CACHE BOOL "" FORCE)
-  set(WITH_TOOLS OFF CACHE BOOL "" FORCE)
-  set(WITH_BENCHMARK_TOOLS OFF CACHE BOOL "" FORCE)
-  set(WITH_CORE_TOOLS OFF CACHE BOOL "" FORCE)
   rocksdb_extensions_fetch_dependency(
     rocksdb
     ${ROCKSDB_EXTENSIONS_ROCKSDB_GIT_REPOSITORY}
