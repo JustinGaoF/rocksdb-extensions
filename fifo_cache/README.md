@@ -24,6 +24,28 @@ compiled into RocksDB itself, so it uses RocksDB's sharded-cache framework and
 utilities directly. It is built and tested against the RocksDB release pinned
 in [`dependencies.lock`](../dependencies.lock) (v11.8.1).
 
+## Quick start
+
+From a checkout of this repository,
+[`scripts/fifo-cache-quick-start.sh`](../scripts/fifo-cache-quick-start.sh)
+builds RocksDB with the plugin, installs it, and runs a short `db_bench`
+comparison of FIFOCache, LRUCache and HyperClockCache:
+
+```bash
+git clone https://github.com/facebook/rocksdb-extensions.git
+cd rocksdb-extensions
+./scripts/fifo-cache-quick-start.sh /path/to/new-dir
+```
+
+It fetches the RocksDB release pinned in `dependencies.lock`, builds it with
+CMake (`Release`, `ROCKSDB_PLUGINS=fifo_cache`) and installs it to
+`/path/to/new-dir/prefix`. It then loads a 1M-key DB and runs the same skewed
+`readrandom` with each cache (64 MiB, 8 threads, 10 seconds each), printing
+ops/sec and the data-block miss ratio per cache. `RUN_BENCHMARK=0` only builds;
+`NUM_KEYS`, `CACHE_SIZE`, `THREADS` and `DURATION` change the benchmark. Short
+runs on a busy machine are noisy, so use an otherwise idle host and repeat
+before drawing conclusions. The sections below do the same steps by hand.
+
 ## Build RocksDB with the plugin
 
 Put this directory into a RocksDB source tree as `plugin/fifo_cache` and
