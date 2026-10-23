@@ -66,6 +66,9 @@ jobs:
           NIMBLE_REVISION: ${{ steps.revisions.outputs.nimble_revision }}
         run: ./scripts/build-latest-releases.sh
 
+      - name: Build and test FIFOCache as a RocksDB plugin
+        run: ./scripts/build-fifo-plugin.sh
+
       - name: Report compiler cache statistics
         if: always()
         run: ccache --show-stats -v || true

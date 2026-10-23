@@ -62,14 +62,15 @@ namespace facebook::rocks {
 // slower. So keep the default unless the cache is much smaller than its hot
 // set.
 //
-// Creating one: call MakeSharedCache, or register the cache with
-// RegisterFIFOCache and pass "fifo_cache://capacity=<n>;..." (the scalar
-// fields below) to Cache::CreateFromString with an empty result, as db_bench
-// --cache_uri does. A nested block_cache={fifo_cache://...} in an options
-// string is not supported: there RocksDB parses the value as options for the
-// block cache already set (the default one), so set block_cache in C++.
-// memory_allocator can only be set in C++. secondary_cache is not supported
-// by this extension.
+// Creating one: call MakeSharedCache, or pass "fifo_cache://capacity=<n>;..."
+// (the scalar fields below) to Cache::CreateFromString with an empty result,
+// as db_bench --cache_uri does. When RocksDB is built with this plugin, the
+// fifo_cache:// factory is registered automatically; when linking the
+// extension library instead, call RegisterFIFOCache once at startup. A nested
+// block_cache={fifo_cache://...} in an options string is not supported: a
+// plugin cannot add the core parsing branch that trims the braces, so set
+// block_cache in C++ there. memory_allocator and secondary_cache can only be
+// set in C++.
 struct FIFOCacheOptions : public ROCKSDB_NAMESPACE::ShardedCacheOptions {
   // Whether to use adaptive mutexes for cache shards. Note that adaptive
   // mutexes need to be supported by the platform in order for this to have any
@@ -98,7 +99,7 @@ struct FIFOCacheOptions : public ROCKSDB_NAMESPACE::ShardedCacheOptions {
         use_adaptive_mutex(_use_adaptive_mutex) {}
 
   // Construct an instance of FIFOCache using these options. Returns nullptr
-  // if num_shard_bits >= 20 or secondary_cache is set.
+  // if num_shard_bits >= 20.
   std::shared_ptr<ROCKSDB_NAMESPACE::Cache> MakeSharedCache() const;
 };
 

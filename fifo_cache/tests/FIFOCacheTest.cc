@@ -3,10 +3,10 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
-#include <atomic>
-
 #include "../src/FIFOCacheImpl.h"
-#ifndef _WIN32
+
+#include <atomic>
+#ifndef OS_WIN
 #include <pthread.h>
 #endif
 #include <chrono>
@@ -24,25 +24,34 @@
 #include <type_traits>
 #include <vector>
 
-#include "../src/SyncPoint.h"
-#include "TestUtil.h"
+#include "cache/lru_cache.h"
+#include "port/port.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/table.h"
+#include "test_util/sync_point.h"
+#include "test_util/testharness.h"
+#include "util/random.h"
+#include "util/thread_local.h"
 #include "rocksdb/utilities/object_registry.h"
 
 namespace facebook::rocks::fifo_cache {
 
+using namespace ROCKSDB_NAMESPACE;  // NOLINT(google-build-using-namespace)
+
 namespace {
 // Registers fifo_cache:// with the default object library once, before any
-// test runs, as an application would at startup.
+// test runs. Needed when the test builds against the extension library;
+// harmless when built as a RocksDB plugin (already registered as a builtin).
 class RegisterFIFOCacheEnvironment : public ::testing::Environment {
  public:
   void SetUp() override { RegisterFIFOCache(*ObjectLibrary::Default(), ""); }
 };
 [[maybe_unused]] ::testing::Environment* const kRegisterFIFOCache =
     ::testing::AddGlobalTestEnvironment(new RegisterFIFOCacheEnvironment);
+}  // namespace
 
+namespace {
 // Secondary-compatible helper whose create callback must never fire: the
 // shard performs primary-only lookup and ignores promotion parameters.
 Status DummyCreate(const Slice& /*data*/, CompressionType /*type*/,
@@ -71,7 +80,7 @@ class FIFOCacheTest : public testing::Test {
   void DeleteCache() {
     if (cache_ != nullptr) {
       cache_->~FIFOCacheShard();
-      CachelineAlignedFree(cache_);
+      port::cacheline_aligned_free(cache_);
       cache_ = nullptr;
     }
   }
@@ -82,7 +91,7 @@ class FIFOCacheTest : public testing::Test {
                 size_t max_capacity = 0) {
     DeleteCache();
     cache_ = static_cast<FIFOCacheShard*>(
-        CachelineAlignedAlloc(sizeof(FIFOCacheShard)));
+        port::cacheline_aligned_alloc(sizeof(FIFOCacheShard)));
     new (cache_) FIFOCacheShard(capacity, strict_capacity_limit,
                                 kDefaultToAdaptiveMutex, metadata_charge_policy,
                                 /*max_upper_hash_bits*/ 24,
@@ -1012,8 +1021,7 @@ TEST_F(FIFOCacheTest, NonStrictGrowthStaysWithinCapacity) {
   EXPECT_TRUE(ContainsForTest("small399"));
 }
 
-#if !defined(ROCKSDB_EXT_MUST_FREE_HEAP_ALLOCATIONS) && \
-    !defined(ROCKSDB_EXT_TSAN)
+#if !defined(MUST_FREE_HEAP_ALLOCATIONS) && !defined(__SANITIZE_THREAD__)
 // A key copy that cannot be allocated fails the insert with MemoryLimit,
 // leaving the value with the caller and nothing cached or charged. (Sanitizer
 // allocators abort on such a request instead of returning nullptr.)
@@ -1036,7 +1044,7 @@ TEST_F(FIFOCacheTest, KeyAllocationFailureFailsInsert) {
                                               /*charge*/ 1,
                                               /*allow_uncharged*/ true));
 }
-#endif  // !ROCKSDB_EXT_MUST_FREE_HEAP_ALLOCATIONS && !ROCKSDB_EXT_TSAN
+#endif  // !MUST_FREE_HEAP_ALLOCATIONS && !__SANITIZE_THREAD__
 
 // R1: batched iteration visits every entry exactly once.
 TEST_F(FIFOCacheTest, ApplyToSomeEntriesCoversAll) {
@@ -1355,7 +1363,7 @@ TEST_F(FIFOCacheTest, ConcurrentOpsKeepUsageConsistent) {
 
   constexpr int kThreads = 4;
   constexpr int kOpsPerThread = 20000;
-  std::vector<std::thread> threads;
+  std::vector<port::Thread> threads;
   threads.reserve(kThreads);
   for (int t = 0; t < kThreads; ++t) {
     threads.emplace_back([&cache, t]() {
@@ -1412,7 +1420,7 @@ TEST_F(FIFOCacheTest, ConcurrentOpsKeepUsageConsistent) {
       }
     });
   }
-  for (std::thread& thread : threads) {
+  for (port::Thread& thread : threads) {
     thread.join();
   }
 
@@ -1623,12 +1631,12 @@ TEST_F(FIFOCacheTest, FullyPinnedTerminates) {
 }
 
 // C1: the adaptive-mutex option is threaded from the options struct into the
-// shard constructor. Mutex exposes no introspection, so this pins the
+// shard constructor. DMutex exposes no introspection, so this pins the
 // plumbing: both values construct a working shard and cache.
 TEST_F(FIFOCacheTest, UseAdaptiveMutexReachesShard) {
   for (bool adaptive : {false, true}) {
     FIFOCacheShard* shard = static_cast<FIFOCacheShard*>(
-        CachelineAlignedAlloc(sizeof(FIFOCacheShard)));
+        port::cacheline_aligned_alloc(sizeof(FIFOCacheShard)));
     Cache::EvictionCallback no_cb;
     new (shard)
         FIFOCacheShard(/*capacity*/ 10,
@@ -1645,7 +1653,7 @@ TEST_F(FIFOCacheTest, UseAdaptiveMutexReachesShard) {
       EXPECT_FALSE(shard->Release(h, true, false));
     }
     shard->~FIFOCacheShard();
-    CachelineAlignedFree(shard);
+    port::cacheline_aligned_free(shard);
 
     FIFOCacheOptions opts(/*capacity*/ 10, /*num_shard_bits*/ 0,
                           /*strict_capacity_limit*/ false, nullptr,
@@ -1938,7 +1946,7 @@ TEST_F(FIFOCacheTest, SetCapacityFoldsOtherThreadsPins) {
   // ReaderSlot records until the shard folds it.
   std::promise<void> pinned;
   std::promise<void> release;
-  std::thread pinner([&] {
+  port::Thread pinner([&] {
     std::vector<FIFOHandle*> handles;
     for (int i = 1; i <= 15; ++i) {
       handles.push_back(Lookup("p" + std::to_string(i)));
@@ -2181,10 +2189,8 @@ TEST_F(FIFOCacheTest, ReleasedEntryEvictableInFullyPinnedShard) {
   EXPECT_EQ(0, cache_->GetPinnedUsage());
 }
 
-// RocksDB's secondary-cache adapter is internal, so this extension does not
-// offer a secondary cache: MakeSharedCache refuses the option rather than
-// silently dropping it.
-TEST_F(FIFOCacheTest, SecondaryCacheNotSupported) {
+// C2: a configured secondary cache wraps the primary instead of failing.
+TEST_F(FIFOCacheTest, SecondaryCacheWrapped) {
   FIFOCacheOptions opts(/*capacity*/ 10, /*num_shard_bits*/ 0,
                         /*strict_capacity_limit*/ false, nullptr,
                         kDefaultToAdaptiveMutex, kDontChargeCacheMetadata);
@@ -2192,9 +2198,14 @@ TEST_F(FIFOCacheTest, SecondaryCacheNotSupported) {
       CompressedSecondaryCacheOptions(/*capacity*/ 1000, /*num_shard_bits*/ 0,
                                       /*strict_capacity_limit*/ false, 0.5)
           .MakeSharedSecondaryCache();
-  EXPECT_EQ(nullptr, opts.MakeSharedCache());
-  opts.secondary_cache = nullptr;
-  EXPECT_NE(nullptr, opts.MakeSharedCache());
+  std::shared_ptr<Cache> cache = opts.MakeSharedCache();
+  ASSERT_NE(nullptr, cache);
+  EXPECT_OK(cache->Insert("a", nullptr, &kNoopCacheItemHelper, 1));
+  Cache::Handle* h = cache->Lookup("a");
+  EXPECT_NE(nullptr, h);
+  if (h != nullptr) {
+    cache->Release(h);
+  }
 }
 
 // R1/R3: a probation victim re-inserted lands in resident, so the same
@@ -2322,7 +2333,7 @@ TEST_F(FIFOCacheTest, GhostBoundedByOccupancy) {
 }
 
 // The ghost queue keeps its bound (no more ghosts than entries in the table,
-// and no more charge than capacity) after SetCapacity lowers
+// and from D123489073 no more charge than capacity) after SetCapacity lowers
 // it, even when the shrink evicts nothing, not only when the next victim is
 // recorded.
 TEST_F(FIFOCacheTest, GhostBoundHoldsAfterCapacityShrink) {
@@ -2383,8 +2394,8 @@ TEST_F(FIFOCacheTest, GhostHashCollisionAdmitsToResident) {
 }
 
 // A placeholder insert (zero charge, kNoopCacheItemHelper), as
-// RocksDB's CacheWithSecondaryAdapter uses to record recent use, neither takes
-// nor leaves a ghost: readmission credit waits for the real entry.
+// CacheWithSecondaryAdapter uses to record recent use, neither takes nor
+// leaves a ghost: readmission credit waits for the real entry.
 TEST_F(FIFOCacheTest, GhostIgnoresPlaceholderInserts) {
   NewCache(/*capacity*/ 10);
   EXPECT_OK(Insert("a"));
@@ -2470,7 +2481,7 @@ TEST_F(FIFOCacheTest, OversizedEntryPaidByProbationFirst) {
   }
 }
 
-// The promotion rule under mixed charges on a shard whose budget rounds to
+// 02's promotion rule under mixed charges on a shard whose budget rounds to
 // zero: every insert is over budget, so eviction is probation-first and
 // probation still sorts twice-hit from once-hit entries.
 TEST_F(FIFOCacheTest, ZeroBudgetMixedChargesKeepPromotion) {
@@ -2497,7 +2508,7 @@ TEST_F(FIFOCacheTest, ZeroBudgetMixedChargesKeepPromotion) {
   EXPECT_EQ(7, cache_->GetUsage());
 }
 
-// Readmission under mixed charges: an oversized probation victim is
+// 03's readmission under mixed charges: an oversized probation victim is
 // remembered and readmitted, then survives a mixed-charge cold stream.
 TEST_F(FIFOCacheTest, GhostReadmitsOversizedVictim) {
   NewCache(/*capacity*/ 100);
@@ -2738,6 +2749,12 @@ TEST_F(FIFOCacheTest, CreateFromStringRoundTripsScalarOptions) {
   }
 }
 
+// NOTE: no CreateFromStringTrimsSpacesInsideBraces here. The core version
+// trims braces and spaces around fifo_cache:// in Cache::CreateFromString
+// itself; a plugin cannot add that branch, so braced values do not reach the
+// factory. Use the bare fifo_cache:// form (and set block_cache in C++ for
+// nested options).
+
 // Invalid configuration fails with InvalidArgument naming the field, and
 // leaves the output empty. (The target starts empty: given an existing
 // cache, RocksDB parses a string with '=' as options for that cache's own
@@ -2778,8 +2795,12 @@ TEST_F(FIFOCacheTest, CreateFromStringRejectsInvalidOptions) {
   }
 }
 
+// A block_cache= string builds the selected FIFOCache, not a fallback:
+// 05's incoming-charge queue choice and charge-plus-slot ghost bound hold.
 // A fifo_cache:// string builds the selected FIFOCache, not a fallback: the
 // incoming-charge queue choice and the charge-plus-slot ghost bound hold.
+// (Direct form: the nested block_cache={...} needs the core parsing branch,
+// so the plugin test builds the cache straight from the URI.)
 TEST_F(FIFOCacheTest, CreateFromStringPreservesSelectedBehavior) {
   auto make = [](size_t capacity) {
     std::shared_ptr<Cache> cache;
@@ -2866,24 +2887,49 @@ TEST_F(FIFOCacheTest, CreateFromStringPreservesSelectedBehavior) {
   EXPECT_FALSE(in_probation(cache, "L45"));
 }
 
-// Registering fifo_cache:// leaves every other cache string as it was:
-// strings without "://" still build an LRUCache, and other URIs, including
-// ones that merely contain "fifo_cache://", are not taken by this factory.
+// Strings that worked before never reach the fifo_cache:// branch: each
+// builds the same LRUCache as the direct factory, and other URIs still go
+// to the object registry.
 TEST_F(FIFOCacheTest, CreateFromStringLeavesExistingStringsUnchanged) {
   ConfigOptions config_options;
-  const std::vector<std::pair<std::string, size_t>> lru_cases = {
-      {"1M", size_t{1} << 20},
-      {"capacity=2M", size_t{2} << 20},
-      {"capacity=1M;num_shard_bits=4;strict_capacity_limit=true;"
-       "high_pri_pool_ratio=0.25;low_pri_pool_ratio=0.125",
-       size_t{1} << 20},
+  LRUCacheOptions full(/*capacity*/ 1 << 20, /*num_shard_bits*/ 4,
+                       /*strict_capacity_limit*/ true,
+                       /*high_pri_pool_ratio*/ 0.25);
+  full.low_pri_pool_ratio = 0.125;
+  const std::string full_str =
+      "capacity=1M;num_shard_bits=4;strict_capacity_limit=true;"
+      "high_pri_pool_ratio=0.25;low_pri_pool_ratio=0.125";
+  const std::vector<std::pair<std::string, std::shared_ptr<Cache>>> cases = {
+      {"1M", NewLRUCache(1 << 20)},
+      {"capacity=2M", NewLRUCache(2 << 20)},
+      {full_str, full.MakeSharedCache()},
+      {"{" + full_str + "}", full.MakeSharedCache()},
   };
-  for (const auto& [value, capacity] : lru_cases) {
-    std::shared_ptr<Cache> cache;
-    ASSERT_OK(Cache::CreateFromString(config_options, value, &cache));
-    ASSERT_NE(nullptr, cache) << value;
-    EXPECT_STREQ("LRUCache", cache->Name()) << value;
-    EXPECT_EQ(capacity, cache->GetCapacity()) << value;
+  for (const auto& [value, expected] : cases) {
+    std::shared_ptr<Cache> direct;
+    ASSERT_OK(Cache::CreateFromString(config_options, value, &direct));
+    BlockBasedTableOptions table_opts;
+    ASSERT_OK(GetBlockBasedTableOptionsFromString(
+        config_options, BlockBasedTableOptions(),
+        "block_cache=" +
+            (value.find(';') == std::string::npos || value[0] == '{'
+                 ? value
+                 : "{" + value + "}"),
+        &table_opts));
+    for (const std::shared_ptr<Cache>& actual :
+         {direct, table_opts.block_cache}) {
+      auto* lru = dynamic_cast<LRUCache*>(actual.get());
+      auto* want = static_cast<LRUCache*>(expected.get());
+      ASSERT_NE(nullptr, lru) << value;
+      EXPECT_STREQ("LRUCache", lru->Name());
+      EXPECT_EQ(want->GetCapacity(), lru->GetCapacity()) << value;
+      EXPECT_EQ(want->GetNumShardBits(), lru->GetNumShardBits()) << value;
+      EXPECT_EQ(want->HasStrictCapacityLimit(), lru->HasStrictCapacityLimit());
+      EXPECT_EQ(want->GetHashSeed(), lru->GetHashSeed()) << value;
+      EXPECT_EQ(want->GetHighPriPoolRatio(), lru->GetHighPriPoolRatio());
+      EXPECT_EQ(want->GetShard(0).GetLowPriPoolRatio(),
+                lru->GetShard(0).GetLowPriPoolRatio());
+    }
   }
 
   for (const char* uri : {"foo://bar", "my_fifo_cache://capacity=1"}) {
@@ -2968,10 +3014,10 @@ TEST_F(FIFOCacheTest, HitsNeverTakeShardLock) {
   PopulateBothQueues(this);
   std::atomic<bool> done{false};
   bool completed = false;
-  std::thread hitter;
+  port::Thread hitter;
   {
-    MutexLock l(cache_->TEST_GetMutex());
-    hitter = std::thread([&] {
+    DMutexLock l(cache_->TEST_GetMutex());
+    hitter = port::Thread([&] {
       HitLoop(this, 1000);
       done.store(true);
     });
@@ -3007,7 +3053,7 @@ TEST_F(FIFOCacheTest, ConcurrentRefChangesKeepCountersExact) {
   NewCache(/*capacity*/ 300);
   constexpr int kThreads = 6;
   std::vector<std::vector<FIFOHandle*>> held(kThreads);
-  std::vector<std::thread> threads;
+  std::vector<port::Thread> threads;
   threads.reserve(kThreads);
   for (int t = 0; t < kThreads; ++t) {
     threads.emplace_back([this, t, &held] {
@@ -3043,7 +3089,7 @@ TEST_F(FIFOCacheTest, ConcurrentRefChangesKeepCountersExact) {
       }
     });
   }
-  for (std::thread& thread : threads) {
+  for (port::Thread& thread : threads) {
     thread.join();
   }
 
@@ -3096,7 +3142,7 @@ void RunWhileParked(const std::string& point, const std::function<void()>& op,
     resumed.wait();
   });
   SyncPoint::GetInstance()->EnableProcessing();
-  std::thread t(op);
+  port::Thread t(op);
   reached.get_future().wait();
   SyncPoint::GetInstance()->DisableProcessing();
   meanwhile();
@@ -3217,7 +3263,7 @@ TEST_F(FIFOCacheTest, ConcurrentStressKeepsLifetimeExact) {
     std::shared_ptr<Cache> cache = opts.MakeSharedCache();
     ASSERT_NE(nullptr, cache);
     constexpr int kThreads = 8;
-    std::vector<std::thread> threads;
+    std::vector<port::Thread> threads;
     threads.reserve(kThreads);
     for (int t = 0; t < kThreads; ++t) {
       threads.emplace_back([&cache, t] {
@@ -3285,7 +3331,7 @@ TEST_F(FIFOCacheTest, ConcurrentStressKeepsLifetimeExact) {
         }
       });
     }
-    for (std::thread& thread : threads) {
+    for (port::Thread& thread : threads) {
       thread.join();
     }
     EXPECT_EQ(0, cache->GetPinnedUsage());
@@ -3314,7 +3360,7 @@ TEST_F(FIFOCacheTest, StrictCapacityHoldsUnderConcurrency) {
   opts.metadata_charge_policy = kFullChargeCacheMetadata;
   std::shared_ptr<Cache> cache = opts.MakeSharedCache();
   ASSERT_NE(nullptr, cache);
-  std::vector<std::thread> threads;
+  std::vector<port::Thread> threads;
   threads.reserve(6);
   for (int t = 0; t < 6; ++t) {
     threads.emplace_back([&cache, t] {
@@ -3347,7 +3393,7 @@ TEST_F(FIFOCacheTest, StrictCapacityHoldsUnderConcurrency) {
       }
     });
   }
-  for (std::thread& thread : threads) {
+  for (port::Thread& thread : threads) {
     thread.join();
   }
   EXPECT_LE(cache->GetUsage(), kCapacity);
@@ -3601,8 +3647,8 @@ TEST_F(FIFOCacheTest, OverwriteWithoutFreeSlotHidesOldValue) {
 }
 
 // Occupancy eviction is bounded by entries: at max table length, each
-// insert of a zero-charge entry (as RocksDB's CacheWithSecondaryAdapter
-// inserts) evicts exactly one entry, not every zero-charge entry it meets.
+// insert of a zero-charge entry (as CacheWithSecondaryAdapter inserts)
+// evicts exactly one entry, not every zero-charge entry it meets.
 TEST_F(FIFOCacheTest, OccupancyEvictionFreesOneEntryPerInsert) {
   NewCache(/*capacity*/ 2048 * 64);
   size_t evicted = 0;
@@ -3641,12 +3687,12 @@ TEST_F(FIFOCacheTest, ConcurrentMaxLengthOverwritesKeepLifetimeExact) {
     std::atomic<bool> done{false};
     // GetPinnedUsage scans the slot table without the shard lock while
     // entries come and go.
-    std::thread poller([&] {
+    port::Thread poller([&] {
       while (!done.load()) {
         cache->GetPinnedUsage();
       }
     });
-    std::vector<std::thread> threads;
+    std::vector<port::Thread> threads;
     threads.reserve(kThreads);
     for (int t = 0; t < kThreads; ++t) {
       threads.emplace_back([&cache, t] {
@@ -3686,7 +3732,7 @@ TEST_F(FIFOCacheTest, ConcurrentMaxLengthOverwritesKeepLifetimeExact) {
         }
       });
     }
-    for (std::thread& thread : threads) {
+    for (port::Thread& thread : threads) {
       thread.join();
     }
     done.store(true);
@@ -3717,7 +3763,7 @@ TEST_F(FIFOCacheTest, GetPinnedUsageTakesNoShardLock) {
   held.push_back(h);
   held.push_back(Lookup("r"));
   held.push_back(Lookup("c7"));
-  std::thread([&] {
+  port::Thread([&] {
     held.push_back(Lookup("r"));
     held.push_back(Lookup("c6"));
   }).join();
@@ -3736,10 +3782,10 @@ TEST_F(FIFOCacheTest, GetPinnedUsageTakesNoShardLock) {
   size_t seen = 0;
   std::atomic<bool> done{false};
   bool completed = false;
-  std::thread reader;
+  port::Thread reader;
   {
-    MutexLock l(cache_->TEST_GetMutex());
-    reader = std::thread([&] {
+    DMutexLock l(cache_->TEST_GetMutex());
+    reader = port::Thread([&] {
       seen = cache_->GetPinnedUsage();
       done.store(true);
     });
@@ -3998,23 +4044,23 @@ TEST_F(FIFOCacheTest, AsideEntryReleasedWhileSetAsideIsEvictable) {
 // commit limit. Linux ignores the flag, and would account the whole
 // reservation, under vm.overcommit_memory=2.
 TEST_F(FIFOCacheTest, LargeCapacityReservesWithoutCommit) {
-#ifdef _WIN32
+#ifdef OS_WIN
   ROCKSDB_GTEST_BYPASS("Windows commits the reservation up front");
   return;
-#endif  // _WIN32
-#ifdef __linux__
+#endif  // OS_WIN
+#ifdef OS_LINUX
   int overcommit_mode = 0;
   std::ifstream("/proc/sys/vm/overcommit_memory") >> overcommit_mode;
   if (overcommit_mode == 2) {
     ROCKSDB_GTEST_BYPASS("strict overcommit accounts the reservation");
     return;
   }
-#endif  // __linux__
+#endif  // OS_LINUX
   // One 16 GiB shard: a 16 GiB slot table.
   NewCache(/*capacity*/ size_t{16} << 30);
   ASSERT_OK(Insert("k"));
   EXPECT_TRUE(LookupBool("k"));
-#ifdef __linux__
+#ifdef OS_LINUX
   FIFOHandle* fifo;
   cache_->TEST_GetFIFOList(&fifo);
   const uintptr_t table = reinterpret_cast<uintptr_t>(fifo);
@@ -4034,7 +4080,7 @@ TEST_F(FIFOCacheTest, LargeCapacityReservesWithoutCommit) {
     }
   }
   EXPECT_NE(std::string::npos, flags.find(" nr ")) << flags;
-#endif  // __linux__
+#endif  // OS_LINUX
 }
 
 // Inserts prefix0..prefix<n-1> and returns the highest slot index any of
@@ -4152,7 +4198,7 @@ TEST_F(FIFOCacheTest, ReaderScanRunsOutsideShardLock) {
         }
       },
       [&] {
-        std::thread locker([&] {
+        port::Thread locker([&] {
           cache_->GetUsage();
           done.store(true);
         });
@@ -4268,7 +4314,7 @@ TEST_F(FIFOCacheTest, LookupAtThreadExitKeepsItsAnnouncement) {
                                           }
                                         });
   SyncPoint::GetInstance()->EnableProcessing();
-  std::thread exiting([&] {
+  port::Thread exiting([&] {
     // Constructed before the thread's first Lookup creates its reader, so
     // destroyed after it.
     ThreadExitLookup().fn = [&] {
@@ -4281,7 +4327,7 @@ TEST_F(FIFOCacheTest, LookupAtThreadExitKeepsItsAnnouncement) {
   // Another thread, likely adopting the released reader, looks up and
   // finishes; then every entry is erased and the table shrinks, but not
   // below the slot the exiting thread's Lookup stands on.
-  std::thread([&] { EXPECT_TRUE(LookupBool("k0")); }).join();
+  port::Thread([&] { EXPECT_TRUE(LookupBool("k0")); }).join();
   cache_->EraseUnRefEntries();
   EXPECT_EQ(0, cache_->GetOccupancyCount());
   EXPECT_EQ(highest - 1, cache_->GetTableAddressCount());
@@ -4310,7 +4356,7 @@ TEST_F(FIFOCacheTest, ConcurrentShrinkKeepsLifetimeExact) {
     ASSERT_NE(nullptr, cache);
     const size_t baseline_usage = cache->GetUsage();
     constexpr int kThreads = 6;
-    std::vector<std::thread> threads;
+    std::vector<port::Thread> threads;
     threads.reserve(kThreads);
     for (int t = 0; t < kThreads; ++t) {
       threads.emplace_back([&cache, t] {
@@ -4351,7 +4397,7 @@ TEST_F(FIFOCacheTest, ConcurrentShrinkKeepsLifetimeExact) {
         }
       });
     }
-    for (std::thread& thread : threads) {
+    for (port::Thread& thread : threads) {
       thread.join();
     }
     EXPECT_EQ(0, cache->GetPinnedUsage());
@@ -4398,7 +4444,7 @@ TEST_F(FIFOCacheTest, ModestPinCountSetsNothingAside) {
   EXPECT_EQ(0, cache_->GetPinnedUsage());
 }
 
-#ifndef _WIN32
+#ifndef OS_WIN
 namespace {
 struct ExitWork {
   FIFOCacheShard* cache;
@@ -4408,7 +4454,7 @@ struct ExitWork {
 
 // Releases the handle its thread pinned, then pins and releases another
 // probation entry. Runs as a pthread key destructor, after the thread's C++
-// thread_local destructors and after another component's key destructor.
+// thread_local destructors and after ThreadLocalPtr's own exit handler.
 void RefChangesAtExit(void* arg) {
   auto* work = static_cast<ExitWork*>(arg);
   if (work->pinned_at_exit != nullptr) {
@@ -4431,17 +4477,15 @@ TEST_F(FIFOCacheTest, RefChangesAtThreadExitStayExact) {
   NewCache(/*capacity*/ 100);
   ASSERT_OK(Insert("a"));
   ASSERT_OK(Insert("b"));
-  // Another component's thread-local state with its own exit handler, set
-  // up before the key below (as RocksDB's ThreadLocalPtr does in a process
-  // that uses it).
-  pthread_key_t other_component;
-  ASSERT_EQ(0, pthread_key_create(&other_component, [](void*) {}));
+  // Another component's thread-local state, set up before the key below, as
+  // in a process where RocksDB's ThreadLocalPtr exit handler runs first.
+  ThreadLocalPtr other_component;
   pthread_key_t key;
   ASSERT_EQ(0, pthread_key_create(&key, &RefChangesAtExit));
 
   ExitWork used_before{cache_, nullptr, "b"};
   std::thread first([&] {
-    pthread_setspecific(other_component, &used_before);
+    other_component.Reset(&used_before);
     // Pins a probation entry, released only at exit.
     used_before.pinned_at_exit = Lookup("a");
     ASSERT_NE(nullptr, used_before.pinned_at_exit);
@@ -4452,9 +4496,8 @@ TEST_F(FIFOCacheTest, RefChangesAtThreadExitStayExact) {
   EXPECT_EQ(cache_->TEST_GetProbationUsage(),
             cache_->TEST_GetProbationUnpinnedUsage());
   ASSERT_EQ(0, pthread_key_delete(key));
-  ASSERT_EQ(0, pthread_key_delete(other_component));
 }
-#endif  // _WIN32
+#endif  // OS_WIN
 
 #ifndef NDEBUG
 // The reader scan runs once per ReaderWorkInterval() calls, which grows with
@@ -4473,7 +4516,7 @@ TEST_F(FIFOCacheTest, ReaderScanIntervalGrowsWithReaders) {
     std::mutex mu;
     std::condition_variable cv;
     int arrived = 0;
-    std::vector<std::thread> threads;
+    std::vector<port::Thread> threads;
     threads.reserve(kThreads);
     for (int t = 0; t < kThreads; ++t) {
       threads.emplace_back([&] {
@@ -4486,7 +4529,7 @@ TEST_F(FIFOCacheTest, ReaderScanIntervalGrowsWithReaders) {
         }
       });
     }
-    for (std::thread& t : threads) {
+    for (port::Thread& t : threads) {
       t.join();
     }
   }
@@ -4519,3 +4562,9 @@ TEST_F(FIFOCacheTest, ReaderScanIntervalGrowsWithReaders) {
 #endif  // !NDEBUG
 
 }  // namespace facebook::rocks::fifo_cache
+
+int main(int argc, char** argv) {
+  ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}
