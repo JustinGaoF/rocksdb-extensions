@@ -182,3 +182,7 @@ make -j"$(nproc)" DEBUG_LEVEL=0 USE_RTTI=1 ROCKSDB_PLUGINS=fifo_cache \
   'TEST_LIBRARY=$(TESTHARNESS)' fifo_cache_test
 ./fifo_cache_test
 ```
+
+[`scripts/build-fifo-cache-plugin.sh`](../scripts/build-fifo-cache-plugin.sh)
+runs what CI runs: it fetches the pinned RocksDB, builds and runs the tests in
+both of these builds, and checks that `db_bench --cache_uri` uses FIFOCache.
